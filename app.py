@@ -3,30 +3,25 @@ import pyupbit
 import pandas as pd
 import numpy as np
 import time
+from datetime import datetime
 
 # ----------------------------------------
-# 1. 고도화된 통계 및 모멘텀 지표 엔진
+# 1. 지표 연산 및 Z-Score 퀀트 엔진
 # ----------------------------------------
 def add_advanced_indicators(df):
-    # 기본 이동평균
     df['ma5'] = df['close'].rolling(5).mean()
     df['ma20'] = df['close'].rolling(20).mean()
-    df['ma60'] = df['close'].rolling(60).mean()
     
-    # 1. 거래량 Z-Score (통계적 이상치 탐지)
-    # 최근 60개 캔들의 거래량 평균과 표준편차를 구함
     vol_mean = df['volume'].rolling(window=60).mean()
     vol_std = df['volume'].rolling(window=60).std()
     df['vol_zscore'] = (df['volume'] - vol_mean) / (vol_std + 1e-9)
     
-    # 2. 가격 변동성 (ATR)
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
     low_close = np.abs(df['low'] - df['close'].shift())
     ranges = pd.concat([high_low, high_close, low_close], axis=1)
     df['atr'] = np.max(ranges, axis=1).rolling(14).mean()
     
-    # 3. MACD & RSI 모멘텀
     ema12 = df['close'].ewm(span=12, adjust=False).mean()
     ema26 = df['close'].ewm(span=26, adjust=False).mean()
     df['macd'] = ema12 - ema26
@@ -36,15 +31,10 @@ def add_advanced_indicators(df):
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
     df['rsi'] = 100 - (100 / (1 + (up.ewm(com=13, adjust=False).mean() / (down.ewm(com=13, adjust=False).mean() + 1e-9))))
-    
     return df
 
-# ----------------------------------------
-# 2. V12 Z-Score 돌파 스캐너 
-# ----------------------------------------
 def z_score_breakout_scan(coin):
     try:
-        # 5분봉과 15분봉의 교차 검증 (속도와 정확성 밸런스)
         df_15m = pyupbit.get_ohlcv(coin, interval="minute15", count=100)
         df_5m = pyupbit.get_ohlcv(coin, interval="minute5", count=150)
         
@@ -57,101 +47,137 @@ def z_score_breakout_scan(coin):
         last_15m = df_15m.iloc[-1]
         last_5m = df_5m.iloc[-1]
         
-        # [조건 1] 15분봉 거시 추세: 20일선 위 유지 및 MACD 상승세
         trend_15m = (last_15m['close'] > last_15m['ma20']) and (last_15m['macd'] > last_15m['macd_signal'])
-        
-        # [조건 2] 5분봉 Z-Score 거래량 폭발: 거래량 Z값이 2.5 이상 (정규분포 0.6% 극단치)
         vol_breakout = last_5m['vol_zscore'] >= 2.5
-        
-        # [조건 3] 5분봉 가격 모멘텀: 5일선이 20일선을 강하게 상향 돌파 중 (RSI 과매수 직전)
         price_momentum = (last_5m['close'] > last_5m['ma5']) and (last_5m['rsi'] >= 55) and (last_5m['rsi'] <= 75)
         
         if trend_15m and vol_breakout and price_momentum:
-            curr_price = last_5m['close']
-            atr_val = last_5m['atr']
-            
-            # 동적 트레일링 스탑 가이드라인 (ATR 기반)
-            # 변동성이 클수록 손절폭과 목표가를 넓게, 작을수록 좁게 설정
-            stop_loss = curr_price - (atr_val * 1.5)
-            trailing_start = curr_price + (atr_val * 2.0)
-            
-            return {
-                "현재가": curr_price,
-                "손절선(SL)": stop_loss,
-                "추적익절(Trailing) 시작가": trailing_start,
-                "Z-Score": round(last_5m['vol_zscore'], 2)
-            }
-        return None
+            return True
+        return False
     except Exception:
-        return None
+        return False
 
 # ----------------------------------------
-# Streamlit UI
+# Streamlit UI & 자동매매 상태 관리
 # ----------------------------------------
-st.set_page_config(page_title="V12 Z-Score 퀀트 머신", layout="wide")
+st.set_page_config(page_title="V13 자동매매 퀀트 머신", layout="wide")
 
-TOTAL_SEED_MONEY = 2500000  # 총 시드머니 250만 원
+if 'highest_prices' not in st.session_state:
+    st.session_state['highest_prices'] = {} # 보유 종목의 고점 추적용 (트레일링 스탑)
 
-# 고거래량 메이저 및 밈/레이어1 알트코인
 TARGET_COINS = [
     "KRW-BTC", "KRW-SOL", "KRW-XRP", "KRW-DOGE", "KRW-SHIB", 
-    "KRW-SEI", "KRW-SUI", "KRW-STX", "KRW-LINK", "KRW-AVAX",
-    "KRW-NEAR", "KRW-APT", "KRW-ASTR", "KRW-PYTH", "KRW-ARB"
+    "KRW-SEI", "KRW-SUI", "KRW-STX", "KRW-LINK", "KRW-AVAX"
 ]
+MAX_INVEST_PER_COIN = 500000 # 1회 최대 진입 비중 (50만 원)
 
 st.markdown("""
     <style>
     .stApp { background-color: #0b0f19; color: #f0f2f6; }
-    .metric-card { background-color: #1e253c; padding: 20px; border-radius: 10px; margin-bottom: 20px; text-align: center; }
+    .sidebar .sidebar-content { background-color: #161b22; }
     </style>
     """, unsafe_allow_html=True)
 
-st.title("📈 V12 Z-Score 기반 통계적 돌파 스캐너")
-st.markdown(f"총 운용 자산 **{TOTAL_SEED_MONEY:,} 원**을 기반으로, 켈리 공식 관점에 맞춘 리스크 분배와 Z-Score 거래량 이상치를 실시간으로 추적합니다.")
+st.title("🤖 V13 업비트 실전 자동매매 시스템")
+st.markdown("API 키를 입력하면 **실제 계좌의 원화(KRW)로 시장가 매수/매도를 자동 집행**합니다.")
 
-# 대시보드 요약
-col1, col2 = st.columns(2)
-with col1:
-    st.markdown(f"<div class='metric-card'><h3>총 시드머니</h3><h2>{TOTAL_SEED_MONEY:,} 원</h2></div>", unsafe_allow_html=True)
-with col2:
-    max_position = int(TOTAL_SEED_MONEY * 0.20) # 1회 최대 진입 비중 20%
-    st.markdown(f"<div class='metric-card'><h3>1회 권장 투입 한도 (20%)</h3><h2 style='color:#00FFAA;'>{max_position:,} 원</h2></div>", unsafe_allow_html=True)
+# 사이드바: API 키 입력 및 계좌 연동
+st.sidebar.header("🔑 업비트 API 연동")
+access_key = st.sidebar.text_input("Access Key", type="password")
+secret_key = st.sidebar.text_input("Secret Key", type="password")
 
-auto_mode = st.toggle("🤖 5분 주기 Z-Score 감시 모드 켜기", value=False)
+upbit = None
+krw_balance = 0
+
+if access_key and secret_key:
+    upbit = pyupbit.Upbit(access_key, secret_key)
+    try:
+        krw_balance = upbit.get_balance("KRW")
+        st.sidebar.success(f"연동 성공! 보유 원화: {int(krw_balance):,} 원")
+    except Exception as e:
+        st.sidebar.error("API 키가 올바르지 않거나 권한이 없습니다.")
+        upbit = None
+
+# 자동매매 가동 스위치
+auto_mode = st.toggle("🚀 실전 자동매매 가동 (주의: 실제 돈이 거래됩니다)", value=False)
 
 if auto_mode:
-    st.info("🔄 시장의 통계적 이상치(Anomaly)를 탐색 중입니다...")
-    
-    results = []
-    progress_bar = st.progress(0)
-    
-    for idx, coin in enumerate(TARGET_COINS):
-        time.sleep(0.3)
-        scan = z_score_breakout_scan(coin)
+    if upbit is None:
+        st.error("⚠️ 사이드바에 올바른 API 키를 먼저 입력해야 자동매매가 작동합니다.")
+        st.stop()
         
-        if scan:
-            results.append({
-                "코인명": coin.replace("KRW-", ""),
-                "진입 현재가": f"{scan['현재가']:,.4f} 원",
-                "📊 거래량 폭발 지수": f"Z={scan['Z-Score']} (초강세)",
-                "🛡️ 절대 손절선": f"{scan['손절선(SL)']:,.4f} 원",
-                "🚀 트레일링 익절 시작선": f"{scan['추적익절(Trailing) 시작가']:,.4f} 원"
-            })
-        progress_bar.progress((idx + 1) / len(TARGET_COINS))
-        
-    progress_bar.empty()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.info(f"🔄 [{now_str}] 자동매매 엔진 가동 중... (포지션 관리 및 타점 스캔)")
     
-    if results:
-        res_df = pd.DataFrame(results)
-        st.success(f"🔥 통계적 유의성을 가진 돌파 타점이 {len(results)}건 포착되었습니다.")
-        st.dataframe(res_df, use_container_width=True, hide_index=True)
+    logs = []
+    
+    # ----------------------------------------
+    # [핵심] 자동매매 로직 실행
+    # ----------------------------------------
+    for coin in TARGET_COINS:
+        time.sleep(0.3) # API 제한 방지
         
-        st.warning(f"💡 **V12 자금 운용 규칙:** 진입 시그널이 떴더라도 한 종목에 **{max_position:,} 원** 이상 진입하지 마십시오. 또한 가격이 [🚀 트레일링 익절 시작선]을 돌파하면 그때부터는 지정가 매도가 아닌, 가격이 꺾일 때 시장가로 던지는 '추세 추종'을 시작하십시오.")
-    else:
-        st.write(f"🕒 현재 시각 {time.strftime('%H:%M:%S')} - 시장 내 통계적 이상치 없음 (노이즈 구간)")
+        # 1. 내 계좌에 해당 코인이 있는지(포지션 유무) 확인
+        coin_ticker = coin.replace("KRW-", "")
+        coin_balance = upbit.get_balance(coin_ticker)
+        curr_price = pyupbit.get_current_price(coin)
+        
+        # 보유 금액이 5,000원 이상이면 '보유 중'으로 간주 -> 매도 관리(익절/손절) 돌입
+        if coin_balance * curr_price > 5000:
+            avg_buy_price = upbit.get_avg_buy_price(coin_ticker)
+            
+            # 보유 종목의 고점(Highest Price) 갱신
+            if coin not in st.session_state['highest_prices']:
+                st.session_state['highest_prices'][coin] = curr_price
+            else:
+                st.session_state['highest_prices'][coin] = max(st.session_state['highest_prices'][coin], curr_price)
+                
+            highest_p = st.session_state['highest_prices'][coin]
+            profit_rate = (curr_price - avg_buy_price) / avg_buy_price * 100
+            
+            # [매도 조건 A] 트레일링 스탑: 고점 대비 1.5% 하락 시 시장가 전량 매도 (수익 보존)
+            if curr_price <= highest_p * 0.985 and highest_p > avg_buy_price * 1.02:
+                upbit.sell_market_order(coin, coin_balance)
+                logs.append(f"🟢 [트레일링 스탑 익절] {coin} 매도 완료 (수익률: {profit_rate:+.2f}%)")
+                del st.session_state['highest_prices'][coin] # 고점 데이터 초기화
+                
+            # [매도 조건 B] 칼손절: 매수 평단가 대비 -2% 도달 시 즉시 시장가 매도 (계좌 보호)
+            elif curr_price <= avg_buy_price * 0.98:
+                upbit.sell_market_order(coin, coin_balance)
+                logs.append(f"🔴 [손절 라인 이탈] {coin} 매도 완료 (수익률: {profit_rate:+.2f}%)")
+                if coin in st.session_state['highest_prices']:
+                    del st.session_state['highest_prices'][coin]
+                    
+            else:
+                logs.append(f"👁️ [보유 중] {coin} | 평단가: {int(avg_buy_price):,} | 현재가: {int(curr_price):,} ({profit_rate:+.2f}%)")
+                
+        # 2. 보유하고 있지 않다면 -> 매수 타점 스캔
+        else:
+            is_buy_signal = z_score_breakout_scan(coin)
+            
+            if is_buy_signal:
+                krw_bal = upbit.get_balance("KRW")
+                # 살 돈이 최소 5,000원 이상 남아있는지 확인
+                if krw_bal > 5000:
+                    # 최대 투입 한도(50만원)와 현재 잔고 중 작은 금액으로 매수
+                    invest_amount = min(MAX_INVEST_PER_COIN, krw_bal * 0.99) # 수수료 여유분 1% 제외
+                    upbit.buy_market_order(coin, invest_amount)
+                    st.session_state['highest_prices'][coin] = curr_price # 고점 기록 시작
+                    logs.append(f"🚀 [강력 매수 체결] {coin} | {int(invest_amount):,} 원 진입 완료!")
+                else:
+                    logs.append(f"⚠️ [매수 실패] {coin} 타점 발생했으나 잔고 부족")
 
-    with st.spinner("다음 5분봉 갱신 대기 중 (5분 간격)..."):
-        time.sleep(300)
+    # ----------------------------------------
+    # 실행 로그 출력 및 무한 루프 갱신
+    # ----------------------------------------
+    if logs:
+        for log in logs:
+            st.write(log)
+            
+    with st.spinner("다음 사이클을 기다리는 중... (3분 간격 감시)"):
+        # 포지션 관리의 민첩성을 높이기 위해 5분 대기 대신 3분 대기로 단축
+        time.sleep(180) 
         st.rerun()
+
 else:
-    st.warning("상단의 스위치를 켜면 스캔이 시작됩니다.")
+    st.warning("스위치를 켜면 실제 원화 계좌와 연동되어 매수/매도가 자동 진행됩니다.")
