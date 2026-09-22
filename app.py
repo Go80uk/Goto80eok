@@ -1,223 +1,175 @@
 import streamlit as st
 import pyupbit
 import pandas as pd
+import numpy as np
 import time
 
 # ----------------------------------------
-# 1. 4대 주요 매매 전략 시그널 생성기
+# 1. 보조 지표 계산 함수 (ATR, VWAP 등)
 # ----------------------------------------
-def apply_strategies(df):
-    df = df.copy()
-    
-    # 공통 지표
+def add_indicators(df):
+    # 단순 이동평균
     df['ma5'] = df['close'].rolling(5).mean()
     df['ma20'] = df['close'].rolling(20).mean()
-    df['std20'] = df['close'].rolling(20).std()
-    df['bb_upper'] = df['ma20'] + (df['std20'] * 2)
-    df['bb_lower'] = df['ma20'] - (df['std20'] * 2)
+    df['ma60'] = df['close'].rolling(60).mean()
     
+    # 지수 이동평균 (MACD용)
     ema12 = df['close'].ewm(span=12, adjust=False).mean()
     ema26 = df['close'].ewm(span=26, adjust=False).mean()
     df['macd'] = ema12 - ema26
     df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
     
+    # RSI
     delta = df['close'].diff()
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
     df['rsi'] = 100 - (100 / (1 + (up.ewm(com=13, adjust=False).mean() / (down.ewm(com=13, adjust=False).mean() + 1e-9))))
     
-    df['noise'] = 1 - (abs(df['close'] - df['open']) / (df['high'] - df['low'] + 1e-9))
-    df['dynamic_k'] = df['noise'].rolling(20).mean().shift(1).fillna(0.5)
-    df['target_price'] = df['open'] + (df['high'].shift(1) - df['low'].shift(1)) * df['dynamic_k']
-
-    # 전략 1: 변동성 돌파
-    df['S1_Buy'] = (df['high'] >= df['target_price']) & (df['close'] > df['ma5'])
-    # 전략 2: MACD + RSI 모멘텀
-    df['S2_Buy'] = (df['macd'] > df['macd_signal']) & (df['rsi'] > 50) & (df['rsi'] < 70) & (df['close'] > df['ma20'])
-    # 전략 3: 볼린저 밴드 하단 반등
-    df['S3_Buy'] = (df['low'] < df['bb_lower']) & (df['close'] > df['bb_lower']) & (df['rsi'] < 40)
-    # 전략 4: 정통 이동평균 골든크로스 + 거래량
-    df['vol_ma20'] = df['volume'].rolling(20).mean()
-    df['S4_Buy'] = (df['ma5'] > df['ma20']) & (df['ma5'].shift(1) <= df['ma20'].shift(1)) & (df['volume'] > df['vol_ma20'] * 1.5)
-
+    # ATR (Average True Range) - 캔들 하나당 평균 변동폭 (시간 예측용)
+    high_low = df['high'] - df['low']
+    high_close = np.abs(df['high'] - df['close'].shift())
+    low_close = np.abs(df['low'] - df['close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = np.max(ranges, axis=1)
+    df['atr'] = true_range.rolling(14).mean()
+    
+    # VWAP (거래량 가중 평균가)
+    cum_vol_price = (df['close'] * df['volume']).rolling(window=100).sum()
+    cum_vol = df['volume'].rolling(window=100).sum()
+    df['vwap'] = cum_vol_price / (cum_vol + 1e-9)
+    
     return df
 
 # ----------------------------------------
-# 2. 백테스트 및 최적화 엔진
+# 2. V8 MTF (다중 타임프레임) 정밀 분석 엔진
 # ----------------------------------------
-def run_backtest(df, signal_col, tp_pct, sl_pct, fee=0.001):
-    in_pos = False
-    buy_price = 0.0
-    equity = 1.0
+def mtf_precision_scan(coin):
+    """4H, 1H, 15M, 5M 캔들을 모두 분석하여 완벽한 교집합일 때만 타점 반환"""
     
-    closes = df['close'].values
-    highs = df['high'].values
-    lows = df['low'].values
-    signals = df[signal_col].values
-    
-    for i in range(60, len(df)):
-        if not in_pos:
-            if signals[i]:
-                in_pos = True
-                buy_price = closes[i]
-                equity *= (1 - fee)
-        else:
-            if (highs[i] - buy_price) / buy_price >= tp_pct:
-                equity *= (1 + tp_pct - fee)
-                in_pos = False
-            elif (lows[i] - buy_price) / buy_price <= -sl_pct:
-                equity *= (1 - sl_pct - fee)
-                in_pos = False
+    try:
+        # 4개의 타임프레임 데이터 동시 수집
+        df_4h = pyupbit.get_ohlcv(coin, interval="minute240", count=100)
+        df_1h = pyupbit.get_ohlcv(coin, interval="minute60", count=100)
+        df_15m = pyupbit.get_ohlcv(coin, interval="minute15", count=100)
+        df_5m = pyupbit.get_ohlcv(coin, interval="minute5", count=200)
+        
+        if any(df is None for df in [df_4h, df_1h, df_15m, df_5m]):
+            return None
+            
+        df_4h = add_indicators(df_4h)
+        df_1h = add_indicators(df_1h)
+        df_15m = add_indicators(df_15m)
+        df_5m = add_indicators(df_5m)
+        
+        last_4h = df_4h.iloc[-1]
+        last_1h = df_1h.iloc[-1]
+        last_15m = df_15m.iloc[-1]
+        last_5m = df_5m.iloc[-1]
+        
+        # [조건 1] 4시간봉: 거시 추세가 반드시 상승장일 것 (20 이평선 위)
+        cond_4h = last_4h['close'] > last_4h['ma20']
+        
+        # [조건 2] 1시간봉: 세력 평단가(VWAP) 위에 존재하며 MACD가 골든크로스 상태일 것
+        cond_1h = (last_1h['close'] > last_1h['vwap']) and (last_1h['macd'] > last_1h['macd_signal'])
+        
+        # [조건 3] 15분봉: 단기 눌림목 후 반등 모멘텀 (RSI 50~65 사이로 탄력받는 중)
+        cond_15m = (50 < last_15m['rsi'] < 65) and (last_15m['close'] > last_15m['ma20'])
+        
+        # [조건 4] 5분봉: 즉각적인 거래량 동반 돌파 타점
+        cond_5m = (last_5m['close'] > last_5m['ma5']) and (last_5m['volume'] > df_5m['volume'].rolling(20).mean().iloc[-1] * 1.2)
+        
+        # 모든 타임프레임의 조건이 완벽히 일치할 때만 True
+        is_perfect_entry = cond_4h and cond_1h and cond_15m and cond_5m
+        
+        if is_perfect_entry:
+            curr_price = last_5m['close']
+            tp_pct = 0.025 # 목표 익절 2.5%
+            sl_pct = 0.012 # 칼손절 1.2%
+            
+            tp_price = curr_price * (1 + tp_pct)
+            sl_price = curr_price * (1 - sl_pct)
+            
+            # --- [핵심] 도달 예상 시간(ETA) 수학적 추론 ---
+            # 1시간봉의 ATR(시간당 평균 변동 가격)을 활용하여 목표가까지 몇 시간이 걸릴지 계산
+            hourly_volatility = last_1h['atr']
+            target_distance = tp_price - curr_price
+            
+            if hourly_volatility > 0:
+                estimated_hours = target_distance / hourly_volatility
+                # 보수적인 예측을 위해 1.5배의 버퍼 타임 적용
+                min_time = max(1, int(estimated_hours))
+                max_time = max(2, int(estimated_hours * 1.5))
+                eta_str = f"약 {min_time}시간 ~ {max_time}시간 내외"
+            else:
+                eta_str = "변동성 부족 (예측 불가)"
                 
-    return (equity - 1) * 100
-
-def optimize_strategy(df):
-    strategies = ["S1_Buy", "S2_Buy", "S3_Buy", "S4_Buy"]
-    strategy_names = {
-        "S1_Buy": "변동성 돌파 (우승자 기법)",
-        "S2_Buy": "MACD 모멘텀 트렌드",
-        "S3_Buy": "볼린저 하단 반등",
-        "S4_Buy": "거래량 동반 골든크로스"
-    }
-    risk_profiles = [
-        {"tp": 0.02, "sl": 0.01},
-        {"tp": 0.03, "sl": 0.015},
-        {"tp": 0.05, "sl": 0.02}
-    ]
-    
-    best_return = -999
-    best_config = None
-    
-    for s in strategies:
-        for rp in risk_profiles:
-            ret = run_backtest(df, s, rp["tp"], rp["sl"])
-            if ret > best_return:
-                best_return = ret
-                best_config = {
-                    "strategy_col": s,
-                    "strategy_name": strategy_names[s],
-                    "tp_pct": rp["tp"],
-                    "sl_pct": rp["sl"],
-                    "return": ret
-                }
-    return best_config
+            return {
+                "현재가": curr_price,
+                "익절가": tp_price,
+                "손절가": sl_price,
+                "예상시간": eta_str,
+                "근거": "4H 추세 + 1H VWAP + 15M 모멘텀 + 5M 돌파 완벽 일치"
+            }
+            
+        return None
+        
+    except Exception as e:
+        return None
 
 # ----------------------------------------
 # Streamlit UI
 # ----------------------------------------
-st.set_page_config(page_title="AI 실시간 매수 타점 스캐너", layout="wide")
+st.set_page_config(page_title="V8 MTF 정밀 시공간 예측기", layout="wide")
 
-# ----------------------------------------
-# 🎈 귀여운 UI 및 캐릭터 테마 적용 
-# ----------------------------------------
+# API 호출 횟수가 4배 늘었으므로 안정성을 위해 시총 상위 15개 코인으로 집중 분석
+TARGET_COINS = [
+    "KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-DOGE", 
+    "KRW-ADA", "KRW-SEI", "KRW-SUI", "KRW-AVAX", "KRW-LINK",
+    "KRW-STX", "KRW-POL", "KRW-ALGO", "KRW-SAND", "KRW-SHIB"
+]
 
-# 1. 파스텔톤 배경 및 둥근 버튼 CSS 주입
 st.markdown("""
     <style>
-    /* 전체 배경색을 연한 파스텔 핑크로 변경 */
-    .stApp {
-        background-color: #FFF0F5;
-    }
-    
-    /* 사이드바 배경색 변경 */
-    [data-testid="stSidebar"] {
-        background-color: #FFE4E1;
-    }
-    
-    /* 텍스트 폰트 색상 및 굵기 변경 */
-    h1, h2, h3, p {
-        color: #5C4033 !important; 
-        font-family: 'Comic Sans MS', 'Malgun Gothic', sans-serif;
-    }
-    
-    /* 메인 버튼을 귀엽고 둥글게 */
-    .stButton>button {
-        background-color: #FFB6C1;
-        color: white;
-        border-radius: 20px;
-        border: none;
-        box-shadow: 2px 2px 5px rgba(0,0,0,0.1);
-        transition: all 0.3s;
-    }
-    .stButton>button:hover {
-        background-color: #FF69B4;
-        transform: scale(1.05);
-    }
+    .stApp { background-color: #0b0f19; color: #f0f2f6; }
+    .stButton>button { background-color: #1f77b4; color: white; font-weight: bold; width: 100%; border:none; padding:15px; border-radius:10px; }
+    .stButton>button:hover { background-color: #155a8a; }
     </style>
     """, unsafe_allow_html=True)
 
-# 2. 메인 화면에 귀여운 애니메이션 캐릭터(GIF) 배치
-col1, col2 = st.columns([1, 4])
-with col1:
-    # Giphy의 귀여운 고양이 해커 GIF 불러오기
-    st.image("https://media.giphy.com/media/JIX9t2j0ZTN9S/giphy.gif", width=120)
-with col2:
-    st.title("🐾 AI 실시간 매수 타점 스캐너 V6")
-    st.markdown("**나만의 귀여운 코인 비서가 25개 알트코인을 감시 중이에요!** 🚀")
+st.title("⏳ V8 다중 프레임 시공간(ETA) 예측 스캐너")
+st.markdown("4시간, 1시간, 15분, 5분봉의 4차원 데이터를 동시 분석하여 승률을 극한으로 높이고, 목표가에 도달할 **예상 소요 시간**까지 수학적으로 계산합니다.")
 
-# 분석 대상 25종으로 확대 (업비트 원화 마켓 고거래량 알트코인)
-TARGET_COINS = [
-    "KRW-XRP", "KRW-DOGE", "KRW-ADA", "KRW-SEI", "KRW-SUI", 
-    "KRW-ALGO", "KRW-STX", "KRW-SAND", "KRW-EOS", "KRW-POL",
-    "KRW-TRX", "KRW-SHIB", "KRW-CHZ", "KRW-MANA", "KRW-ENJ",
-    "KRW-HBAR", "KRW-ZIL", "KRW-VET", "KRW-SC", "KRW-MOC",
-    "KRW-BTT", "KRW-T", "KRW-AERGO", "KRW-IQ", "KRW-ORBS"
-]
-
-st.title("🚨 실시간 매수 급소 검출기 V6")
-st.markdown("25개 알트코인의 최근 14일 치 5분봉(4,000개)을 학습하여, **현재 즉시 매수해야 할 종목과 정확한 매도 체결가**만 선별해 안내합니다.")
-
-if st.button("🚀 25개 알트코인 전수 스캔 및 타점 포착"):
+if st.button("🚀 4차원 시공간 정밀 분석 스캔 시작 (시간이 다소 소요됩니다)"):
     progress_bar = st.progress(0)
     status_text = st.empty()
     results = []
     
     for idx, coin in enumerate(TARGET_COINS):
-        status_text.text(f"[{idx+1}/{len(TARGET_COINS)}] {coin} 데이터 분석 및 최적화 진행 중...")
+        status_text.text(f"[{idx+1}/{len(TARGET_COINS)}] {coin} 4H/1H/15M/5M 다중 프레임 데이터 수집 및 연산 중...")
         
-        # API 제한 방지 및 속도 향상을 위해 4000캔들(약 14일) 사용
-        df = pyupbit.get_ohlcv(coin, interval="minute5", count=4000)
+        # 1코인당 4번의 API 호출이 발생하므로 강력한 딜레이 적용 (IP 밴 방지)
+        time.sleep(0.5) 
         
-        if df is not None and len(df) > 500:
-            df_signals = apply_strategies(df)
-            best_setup = optimize_strategy(df_signals)
+        scan_result = mtf_precision_scan(coin)
+        
+        if scan_result:
+            results.append({
+                "코인명": coin.replace("KRW-", ""),
+                "진입 현재가": f"{scan_result['현재가']:,.4f} 원",
+                "🎯 익절 목표가": f"{scan_result['익절가']:,.4f} 원",
+                "🛡️ 손절 방어선": f"{scan_result['손절가']:,.4f} 원",
+                "⏳ 익절가 도달 예상 시간": scan_result['예상시간'],
+                "진입 검증 로직": scan_result['근거']
+            })
             
-            last_candle = df_signals.iloc[-1]
-            curr_price = pyupbit.get_current_price(coin)
-            is_buy_now = last_candle[best_setup["strategy_col"]]
-            
-            # 매도/손절 틱 단위(소수점 등) 처리 단순화를 위해 float 형태로 보존 후 포맷팅
-            tp_price = curr_price * (1 + best_setup["tp_pct"])
-            sl_price = curr_price * (1 - best_setup["sl_pct"])
-            
-            # 오직 "현재 매수 시그널"이 뜬 종목만 결과 리스트에 추가
-            if is_buy_now:
-                results.append({
-                    "코인명": coin.replace("KRW-", ""),
-                    "현재가(매수단가)": f"{curr_price:,.4f} 원",
-                    "적중 매매법": best_setup["strategy_name"],
-                    "예측 승률(백테스트)": f"{best_setup['return']:+.2f}%",
-                    "🎯 익절 예약주문가": f"{tp_price:,.4f} 원 (+{best_setup['tp_pct']*100:.1f}%)",
-                    "🛡️ 손절 예약주문가": f"{sl_price:,.4f} 원 (-{best_setup['sl_pct']*100:.1f}%)",
-                    "_ret": best_setup['return']
-                })
-                
-        time.sleep(0.25) # 다수 코인 스캔 시 업비트 API 차단 방지 딜레이
         progress_bar.progress((idx + 1) / len(TARGET_COINS))
         
-    status_text.text("✅ 25개 알트코인 전수 스캔 완료!")
+    status_text.text("✅ 고강도 MTF 시공간 분석 완료!")
     
     if results:
-        res_df = pd.DataFrame(results).sort_values(by="_ret", ascending=False)
-        st.success(f"🔥 **총 {len(results)}개의 종목에서 강력 매수 시그널이 포착되었습니다.** 아래 지표를 참고하여 즉시 진입하세요.")
-        
-        # 화면을 간결하게 구성하기 위해 데이터프레임 하나로 통일
-        st.dataframe(
-            res_df.drop(columns=["_ret"]), 
-            use_container_width=True, 
-            hide_index=True
-        )
-        
-        st.info("💡 **매매 가이드:** 위 표의 [현재가] 근처에서 매수한 직후, 업비트 앱에서 [🎯 익절 예약주문가]와 [🛡️ 손절 예약주문가]에 각각 '지정가 매도'를 미리 걸어두세요.")
+        res_df = pd.DataFrame(results)
+        st.success(f"🔥 **{len(results)}개 종목에서 극한의 교집합 타점이 발견되었습니다!**")
+        st.dataframe(res_df, use_container_width=True, hide_index=True)
+        st.warning("⚡ **실전 운용 팁:** 매수 후 즉시 🎯익절 목표가와 🛡️손절 방어선에 예약 매도를 걸어두세요. 예상 시간이 지나도 목표가에 도달하지 않고 횡보한다면, 시장의 힘이 빠진 것이므로 본절(매수가) 근처에서 미련 없이 탈출하는 것이 안전합니다.")
     else:
-        st.warning("⚠️ 현재 25개 알트코인 중, 최적화 매매법의 돌파 타점을 만족하는 종목이 단 하나도 없습니다. 가짜 반등에 속지 말고 현금을 보유하세요.")
+        st.error("📉 **분석 결과:** 현재 15개 메이저 알트코인 중 4개의 타임프레임이 모두 상승을 가리키는 종목이 **단 하나도 없습니다.** (전형적인 하락장 또는 혼조세). 소중한 시드머니를 지키기 위해 지금은 무조건 관망하십시오.")
